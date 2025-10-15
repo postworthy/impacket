@@ -40,6 +40,7 @@ Table of Contents
 
 * [Getting Impacket](#getting-impacket)
 * [Setup](#setup)
+* [Virtual filesystem shares](#virtual-filesystem-shares)
 * [Testing](#testing)
 * [Licensing](#licensing)
 * [Disclaimer](#disclaimer)
@@ -90,6 +91,57 @@ Build Impacket's image:
 Using Impacket's image:
 
       $ docker run -it --rm "impacket:latest"
+
+
+Virtual filesystem shares
+=========================
+
+The SMB server can expose an in-memory, read-only filesystem without touching
+disk. This is helpful for testing, demonstrations, and payload staging.
+
+Register a virtual share by pairing a placeholder path (for example,
+`virtual_root`) with a JSON description of the tree:
+
+```
+python3 examples/smbserver.py SHARE virtual_root \
+    --smb2support \
+    --virtual-json '{
+      "public": {
+        "notes.txt": {
+          "content": "These files are virtual.",
+          "mtime": 1700000000,
+          "atime": 1700000000
+        },
+        "report.pdf": "Pretend this is a PDF file"
+      },
+      "private": {}
+    }'
+```
+
+Clients can then connect anonymously and browse the share:
+
+```
+smbclient //127.0.0.1/SHARE -N -c 'ls'
+```
+
+Each JSON key represents a directory or file. String values become file
+contents, while dictionaries let you attach metadata such as `content` and
+optional Unix timestamps (`atime`, `mtime`, `ctime`). The filesystem remains
+read-only regardless of the client’s requests.
+
+For larger layouts, store the JSON in a file and pass it with
+`--virtual-json-file`. The same functionality can be driven by environment
+variables when starting `smbserver.py`:
+
+* `SMBSERVER_VFS=1` – enable automatic registration.
+* `SMBSERVER_VFS_ROOT` – share path tied to the virtual filesystem.
+* `SMBSERVER_VFS_JSON` / `SMBSERVER_VFS_JSON_FILE` – JSON document or path to
+  one.
+* `SMBSERVER_VFS_SHARE` – optional SMB share name override.
+
+No real directory named `virtual_root` is required; lookups are served entirely
+from memory.
+
 
 Testing
 =======

@@ -78,12 +78,14 @@ import unittest
 from time import sleep
 from os.path import exists, join
 from os import mkdir, rmdir, remove
-from multiprocessing import Process
+import shutil
+import subprocess
 
 from six import PY2, StringIO, BytesIO, b, assertRaisesRegex, assertCountEqual
 
 from impacket.smb import SMB_DIALECT
 from impacket.smbserver import normalize_path, isInFileJail, SimpleSMBServer, SMBSERVER
+from impacket.virtualfs import VirtualFS, add_virtual_share, remove_virtual_share
 from impacket.smbconnection import SMBConnection, SessionError, compute_lmhash, compute_nthash
 from threading import Thread
 
@@ -677,6 +679,74 @@ class SimpleSMBServerFuncTests(unittest.TestCase):
         client.closeFile(tree_id, directory_id)
         client.disconnectTree(tree_id)
         client.close()
+
+    def test_virtual_share_listing_and_read(self):
+        share_name = 'VIRTUAL'
+        share_path = 'virtual_root'
+
+        vfs = VirtualFS()
+        vfs.add_dir('test')
+        vfs.add_file('test/test.txt', 'hello world')
+
+        server = self.get_smbserver(add_share=False)
+        server.addShare(share_name, share_path)
+        add_virtual_share(share_path, vfs, share_name=share_name)
+
+        try:
+            self.start_smbserver(server)
+
+            client = self.get_smbclient()
+            try:
+                client.login(self.username, self.password)
+                entries = client.listPath(share_name, '*')
+                names = {entry.get_longname().lower() for entry in entries}
+                self.assertIn('test', names)
+
+                entries = client.listPath(share_name, 'test\\*')
+                names = {entry.get_longname().lower() for entry in entries}
+                self.assertIn('test.txt', names)
+
+                buffer = BytesIO()
+                client.getFile(share_name, 'test\\test.txt', buffer.write)
+                self.assertEqual(buffer.getvalue(), b'hello world')
+            finally:
+                client.close()
+        finally:
+            remove_virtual_share(share_path)
+
+    @unittest.skipUnless(shutil.which('smbclient'), 'smbclient binary not available')
+    def test_virtual_share_with_smbclient(self):
+        share_name = 'VIRTCLI'
+        share_path = 'virtual_cli_root'
+
+        vfs = VirtualFS()
+        vfs.add_dir('test')
+        vfs.add_file('test/test.txt', 'hello world')
+
+        server = self.get_smbserver(add_share=False)
+        server.addShare(share_name, share_path)
+        add_virtual_share(share_path, vfs, share_name=share_name)
+
+        try:
+            self.start_smbserver(server)
+            sleep(0.1)
+            command = [
+                'smbclient',
+                f'//{self.address}/{share_name}',
+                '-U',
+                f'{self.username}%{self.password}',
+                '-p',
+                str(self.port),
+                '-c',
+                'ls; ls test; get test/test.txt -',
+            ]
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn('test', output)
+            self.assertIn('test.txt', output)
+            self.assertIn('hello world', output)
+        finally:
+            remove_virtual_share(share_path)
 
 
 class SimpleSMBServer2FuncTestsClientFallBack(SimpleSMBServerFuncTests):

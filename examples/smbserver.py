@@ -20,6 +20,8 @@ import sys
 import argparse
 import logging
 
+from impacket.virtualfs import VirtualFS, add_virtual_share
+
 from impacket.examples import logger
 from impacket import smbserver, version
 from impacket.ntlm import compute_lmhash, compute_nthash
@@ -32,7 +34,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(add_help = True, description = "This script will launch a SMB Server and add a "
                                      "share specified as an argument. Usually, you need to be root in order to bind to port 445. "
                                      "For optional authentication, it is possible to specify username and password or the NTLM hash. "
-                                     "Example: smbserver.py -comment 'My share' TMP /tmp")
+                                     "Example: smbserver.py -comment 'My share' TMP /tmp\n"
+                                     "In-memory example: smbserver.py SHARE virtual_root --virtual-json '{\"test\": {\"test.txt\": \"hello world\"}}'\n"
+                                     "Test with: smbclient //127.0.0.1/SHARE -N -c 'ls; get test/test.txt -'")
 
     parser.add_argument('shareName', action='store', help='name of the share to add')
     parser.add_argument('sharePath', action='store', help='path of the share to add')
@@ -47,6 +51,10 @@ if __name__ == '__main__':
     parser.add_argument('-dropssp', action='store_true', default=False, help='Disable NTLM ESS/SSP during negotiation')
     parser.add_argument('-6','--ipv6', action='store_true',help='Listen on IPv6')
     parser.add_argument('-smb2support', action='store_true', default=False, help='SMB2 Support (experimental!)')
+    parser.add_argument('--virtual-json', action='store', default=None,
+                        help='JSON document describing a virtual, in-memory filesystem for this share')
+    parser.add_argument('--virtual-json-file', action='store', default=None,
+                        help='Load the virtual filesystem description from a JSON file')
     parser.add_argument('-outputfile', action='store', default=None, help='Output file to log smbserver output messages')
 
     if len(sys.argv)==1:
@@ -75,9 +83,30 @@ if __name__ == '__main__':
         logging.info('Switching output to file %s' % options.outputfile)
         server.setLogFile(options.outputfile)
 
-    server.addShare(options.shareName.upper(), options.sharePath, comment)
+    share_name = options.shareName.upper()
+    server.addShare(share_name, options.sharePath, comment)
     server.setSMB2Support(options.smb2support)
     server.setDropSSP(options.dropssp)
+
+    vfs_spec = None
+    if options.virtual_json_file:
+        try:
+            with open(options.virtual_json_file, 'r', encoding='utf-8') as handle:
+                vfs_spec = handle.read()
+        except OSError as exc:
+            logging.error('Unable to read virtual JSON file %s: %s', options.virtual_json_file, exc)
+            sys.exit(1)
+    elif options.virtual_json:
+        vfs_spec = options.virtual_json
+
+    if vfs_spec is not None:
+        try:
+            vfs = VirtualFS.from_json(vfs_spec)
+        except Exception as exc:
+            logging.error('Invalid virtual filesystem description: %s', exc)
+            sys.exit(1)
+        add_virtual_share(options.sharePath, vfs, share_name=share_name)
+        logging.info('Registered virtual filesystem for share %s', share_name)
 
     # If a user was specified, let's add it to the credentials for the SMBServer. If no user is specified, anonymous
     # connections will be allowed

@@ -38,7 +38,6 @@ import fnmatch
 import errno
 import sys
 import random
-import shutil
 import string
 import hashlib
 import hmac
@@ -50,6 +49,24 @@ from six.moves import configparser, socketserver
 # For signing
 from impacket import smb, nmb, ntlm, uuid
 from impacket import smb3structs as smb2
+from impacket.virtualfs import (
+    vfs_close,
+    vfs_exists,
+    vfs_getsize,
+    vfs_isdir,
+    vfs_isfile,
+    vfs_listdir,
+    vfs_lseek,
+    vfs_mkdir,
+    vfs_open,
+    vfs_read,
+    vfs_rename,
+    vfs_remove,
+    vfs_rmdir,
+    vfs_rmtree,
+    vfs_stat,
+    vfs_write,
+)
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, MechTypes, SPNEGO_NegTokenResp, ASN1_AID, \
     ASN1_SUPPORTED_MECH
 from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED, STATUS_INVALID_PARAMETER, \
@@ -284,11 +301,11 @@ def openFile(path, fileName, accessMode, fileAttributes, openMode):
         mode = os.O_CREAT
     else:
         # If file does not exist, return an error
-        if os.path.exists(pathName) is not True:
+        if vfs_exists(pathName) is not True:
             errorCode = STATUS_NO_SUCH_FILE
             return 0, mode, pathName, errorCode
 
-    if os.path.isdir(pathName) and (fileAttributes & smb.ATTR_DIRECTORY) == 0:
+    if vfs_isdir(pathName) and (fileAttributes & smb.ATTR_DIRECTORY) == 0:
         # Request to open a normal file and this is actually a directory
         errorCode = STATUS_FILE_IS_A_DIRECTORY
         return 0, mode, pathName, errorCode
@@ -301,11 +318,21 @@ def openFile(path, fileName, accessMode, fileAttributes, openMode):
         mode = os.O_RDONLY
 
     try:
-        if sys.platform == 'win32':
-            mode |= os.O_BINARY
-        fid = os.open(pathName, mode)
+        if vfs_isdir(pathName):
+            fid = VOID_FILE_DESCRIPTOR
+        else:
+            if sys.platform == 'win32':
+                mode |= os.O_BINARY
+            fid = vfs_open(pathName, mode)
+    except OSError as e:
+        if e.errno == errno.EISDIR:
+            fid = VOID_FILE_DESCRIPTOR
+        else:
+            LOG.error("openFile: %s,%s,%s", pathName, mode, e)
+            fid = 0
+            errorCode = STATUS_ACCESS_DENIED
     except Exception as e:
-        LOG.error("openFile: %s,%s" % (pathName, mode), e)
+        LOG.error("openFile: %s,%s,%s", pathName, mode, e)
         fid = 0
         errorCode = STATUS_ACCESS_DENIED
 
@@ -320,15 +347,15 @@ def queryFsInformation(path, filename, level=None, pktFlags=smb.SMB.FLAGS2_UNICO
 
     fileName = normalize_path(filename)
     pathName = os.path.join(path, fileName)
-    fileSize = os.path.getsize(pathName)
-    (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = os.stat(pathName)
+    fileSize = vfs_getsize(pathName)
+    (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = vfs_stat(pathName)
 
     if level is None:
         lastWriteTime = mtime
         attribs = 0
-        if os.path.isdir(pathName):
+        if vfs_isdir(pathName):
             attribs |= smb.SMB_FILE_ATTRIBUTE_DIRECTORY
-        if os.path.isfile(pathName):
+        if vfs_isfile(pathName):
             attribs |= smb.SMB_FILE_ATTRIBUTE_NORMAL
         fileAttributes = attribs
         return fileSize, lastWriteTime, fileAttributes
@@ -398,19 +425,19 @@ def findFirst2(path, fileName, level, searchAttributes, pktFlags=smb.SMB.FLAGS2_
         files.append(os.path.join(dirName, '..'))
 
     if pattern != '':
-        if not os.path.exists(dirName):
+        if not vfs_exists(dirName):
             return None, 0, STATUS_OBJECT_NAME_NOT_FOUND
 
-        for file in os.listdir(dirName):
+        for file in vfs_listdir(dirName):
             if fnmatch.fnmatch(file.lower(), pattern.lower()):
                 entry = os.path.join(dirName, file)
-                if os.path.isdir(entry):
+                if vfs_isdir(entry):
                     if searchAttributes & smb.ATTR_DIRECTORY:
                         files.append(entry)
                 else:
                     files.append(entry)
     else:
-        if os.path.exists(pathName):
+        if vfs_exists(pathName):
             files.append(pathName)
 
     searchResult = []
@@ -436,8 +463,8 @@ def findFirst2(path, fileName, level, searchAttributes, pktFlags=smb.SMB.FLAGS2_
             LOG.error("Wrong level %d!" % level)
             return searchResult, searchCount, STATUS_NOT_SUPPORTED
 
-        (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = os.stat(i)
-        if os.path.isdir(i):
+        (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = vfs_stat(i)
+        if vfs_isdir(i):
             item['ExtFileAttributes'] = smb.ATTR_DIRECTORY
         else:
             item['ExtFileAttributes'] = smb.ATTR_NORMAL | smb.ATTR_ARCHIVE
@@ -514,9 +541,9 @@ def queryPathInformation(path, filename, level):
             LOG.error("Path not in current working directory")
             return None, STATUS_OBJECT_PATH_SYNTAX_BAD
 
-        if os.path.exists(pathName):
-            (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = os.stat(pathName)
-            if os.path.isdir(pathName):
+        if vfs_exists(pathName):
+            (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = vfs_stat(pathName)
+            if vfs_isdir(pathName):
                 fileAttributes = smb.ATTR_DIRECTORY
             else:
                 fileAttributes = smb.ATTR_NORMAL | smb.ATTR_ARCHIVE
@@ -539,7 +566,7 @@ def queryPathInformation(path, filename, level):
                 infoRecord = smb.SMBQueryFileStandardInfo()
                 infoRecord['AllocationSize'] = size
                 infoRecord['EndOfFile'] = size
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     infoRecord['Directory'] = 1
                 else:
                     infoRecord['Directory'] = 0
@@ -548,7 +575,7 @@ def queryPathInformation(path, filename, level):
                 infoRecord['AllocationSize'] = size
                 infoRecord['EndOfFile'] = size
                 infoRecord['NumberOfLinks'] = 0
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     infoRecord['Directory'] = 1
                 else:
                     infoRecord['Directory'] = 0
@@ -561,7 +588,7 @@ def queryPathInformation(path, filename, level):
                 infoRecord['ExtFileAttributes'] = fileAttributes
                 infoRecord['AllocationSize'] = size
                 infoRecord['EndOfFile'] = size
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     infoRecord['Directory'] = 1
                 else:
                     infoRecord['Directory'] = 0
@@ -581,7 +608,7 @@ def queryPathInformation(path, filename, level):
                 infoRecord['BasicInformation']['LastAccessTime'] = smb.POSIXtoFT(atime)
                 infoRecord['BasicInformation']['LastWriteTime'] = smb.POSIXtoFT(mtime)
                 infoRecord['BasicInformation']['ChangeTime'] = smb.POSIXtoFT(mtime)
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     infoRecord['BasicInformation']['FileAttributes'] = smb.SMB_FILE_ATTRIBUTE_DIRECTORY
                     infoRecord['StandardInformation']['Directory'] = 1
                     infoRecord['EaInformation']['EaSize'] = smb.ATTR_DIRECTORY
@@ -727,8 +754,8 @@ class TRANSCommands:
         if fid in connData['OpenedFiles']:
             fileHandle = connData['OpenedFiles'][fid]['FileHandle']
             if fileHandle != PIPE_FILE_DESCRIPTOR:
-                os.write(fileHandle, data)
-                respData = os.read(fileHandle, data)
+                vfs_write(fileHandle, data)
+                respData = vfs_read(fileHandle, data)
             else:
                 sock = connData['OpenedFiles'][fid]['Socket']
                 sock.send(data)
@@ -762,7 +789,7 @@ class TRANS2Commands:
                 smbServer.log("Path not in current working directory")
                 errorCode = STATUS_OBJECT_PATH_SYNTAX_BAD
 
-            elif os.path.exists(pathName):
+            elif vfs_exists(pathName):
                 informationLevel = setPathInfoParameters['InformationLevel']
                 if informationLevel == smb.SMB_SET_FILE_BASIC_INFO:
                     infoRecord = smb.SMBSetFileBasicInfo(data)
@@ -835,8 +862,8 @@ class TRANS2Commands:
                     fileHandle = connData['OpenedFiles'][setFileInfoParameters['FID']]['FileHandle']
                     infoRecord = smb.SMBSetFileEndOfFileInfo(data)
                     if infoRecord['EndOfFile'] > 0:
-                        os.lseek(fileHandle, infoRecord['EndOfFile'] - 1, 0)
-                        os.write(fileHandle, b'\x00')
+                        vfs_lseek(fileHandle, infoRecord['EndOfFile'] - 1, 0)
+                        vfs_write(fileHandle, b'\x00')
                 else:
                     smbServer.log('Unknown level for set file info! 0x%x' % setFileInfoParameters['InformationLevel'],
                                   logging.ERROR)
@@ -1495,7 +1522,7 @@ class SMBCommands:
                     if fileHandle == PIPE_FILE_DESCRIPTOR:
                         connData['OpenedFiles'][comClose['FID']]['Socket'].close()
                     elif fileHandle != VOID_FILE_DESCRIPTOR:
-                        os.close(fileHandle)
+                        vfs_close(fileHandle)
                 except Exception as e:
                     smbServer.log("comClose %s" % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
@@ -1503,7 +1530,7 @@ class SMBCommands:
                     # Check if the file was marked for removal
                     if connData['OpenedFiles'][comClose['FID']]['DeleteOnClose'] is True:
                         try:
-                            os.remove(connData['OpenedFiles'][comClose['FID']]['FileName'])
+                            vfs_remove(connData['OpenedFiles'][comClose['FID']]['FileName'])
                         except Exception as e:
                             smbServer.log("comClose %s" % e, logging.ERROR)
                             errorCode = STATUS_ACCESS_DENIED
@@ -1543,9 +1570,9 @@ class SMBCommands:
                     if fileHandle != PIPE_FILE_DESCRIPTOR:
                         # TODO: Handle big size files
                         # If we're trying to write past the file end we just skip the write call (Vista does this)
-                        if os.lseek(fileHandle, 0, 2) >= comWriteParameters['Offset']:
-                            os.lseek(fileHandle, comWriteParameters['Offset'], 0)
-                            os.write(fileHandle, comWriteData['Data'])
+                        if vfs_lseek(fileHandle, 0, 2) >= comWriteParameters['Offset']:
+                            vfs_lseek(fileHandle, comWriteParameters['Offset'], 0)
+                            vfs_write(fileHandle, comWriteData['Data'])
                     else:
                         sock = connData['OpenedFiles'][comWriteParameters['Fid']]['Socket']
                         sock.send(comWriteData['Data'])
@@ -1624,12 +1651,12 @@ class SMBCommands:
                 smbServer.log("Path not in current working directory", logging.ERROR)
                 errorCode = STATUS_OBJECT_PATH_SYNTAX_BAD
 
-            elif os.path.exists(pathName):
+            elif vfs_exists(pathName):
                 errorCode = STATUS_OBJECT_NAME_COLLISION
 
             else:
                 try:
-                    os.mkdir(pathName)
+                    vfs_mkdir(pathName)
                 except Exception as e:
                     smbServer.log("smbComCreateDirectory: %s" % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
@@ -1669,12 +1696,12 @@ class SMBCommands:
                 smbServer.log("Path not in current working directory", logging.ERROR)
                 errorCode = STATUS_OBJECT_PATH_SYNTAX_BAD
 
-            elif not os.path.exists(oldPathName):
+            elif not vfs_exists(oldPathName):
                 errorCode = STATUS_NO_SUCH_FILE
 
             else:
                 try:
-                    os.rename(oldPathName, newPathName)
+                    vfs_rename(oldPathName, newPathName)
                 except OSError as e:
                     smbServer.log("smbComRename: %s" % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
@@ -1712,12 +1739,12 @@ class SMBCommands:
                 smbServer.log("Path not in current working directory", logging.ERROR)
                 errorCode = STATUS_OBJECT_PATH_SYNTAX_BAD
 
-            elif not os.path.exists(pathName):
+            elif not vfs_exists(pathName):
                 errorCode = STATUS_NO_SUCH_FILE
 
             else:
                 try:
-                    os.remove(pathName)
+                    vfs_remove(pathName)
                 except OSError as e:
                     smbServer.log("smbComDelete: %s" % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
@@ -1755,12 +1782,12 @@ class SMBCommands:
                 smbServer.log("Path not in current working directory", logging.ERROR)
                 errorCode = STATUS_OBJECT_PATH_SYNTAX_BAD
 
-            elif not os.path.exists(pathName):
+            elif not vfs_exists(pathName):
                 errorCode = STATUS_NO_SUCH_FILE
 
             else:
                 try:
-                    os.rmdir(pathName)
+                    vfs_rmdir(pathName)
                 except OSError as e:
                     smbServer.log("smbComDeleteDirectory: %s" % e, logging.ERROR)
                     if e.errno == errno.ENOTEMPTY:
@@ -1809,9 +1836,9 @@ class SMBCommands:
                         if 'HighOffset' in writeAndX.fields:
                             offset += (writeAndX['HighOffset'] << 32)
                         # If we're trying to write past the file end we just skip the write call (Vista does this)
-                        if os.lseek(fileHandle, 0, 2) >= offset:
-                            os.lseek(fileHandle, offset, 0)
-                            os.write(fileHandle, writeAndXData['Data'])
+                        if vfs_lseek(fileHandle, 0, 2) >= offset:
+                            vfs_lseek(fileHandle, offset, 0)
+                            vfs_write(fileHandle, writeAndXData['Data'])
                     else:
                         sock = connData['OpenedFiles'][writeAndX['Fid']]['Socket']
                         sock.send(writeAndXData['Data'])
@@ -1854,8 +1881,8 @@ class SMBCommands:
                 try:
                     if fileHandle != PIPE_FILE_DESCRIPTOR:
                         # TODO: Handle big size files
-                        os.lseek(fileHandle, comReadParameters['Offset'], 0)
-                        content = os.read(fileHandle, comReadParameters['Count'])
+                        vfs_lseek(fileHandle, comReadParameters['Offset'], 0)
+                        content = vfs_read(fileHandle, comReadParameters['Count'])
                     else:
                         sock = connData['OpenedFiles'][comReadParameters['Fid']]['Socket']
                         content = sock.recv(comReadParameters['Count'])
@@ -1903,8 +1930,8 @@ class SMBCommands:
                         offset = readAndX['Offset']
                         if 'HighOffset' in readAndX.fields:
                             offset += (readAndX['HighOffset'] << 32)
-                        os.lseek(fileHandle, offset, 0)
-                        content = os.read(fileHandle, readAndX['MaxCount'])
+                        vfs_lseek(fileHandle, offset, 0)
+                        content = vfs_read(fileHandle, readAndX['MaxCount'])
                     else:
                         sock = connData['OpenedFiles'][readAndX['Fid']]['Socket']
                         content = sock.recv(readAndX['MaxCount'])
@@ -2084,7 +2111,7 @@ class SMBCommands:
                 errorCode = STATUS_SUCCESS
                 pathName = connData['OpenedFiles'][queryInformation2['Fid']]['FileName']
                 try:
-                    (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = os.stat(pathName)
+                    (mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime) = vfs_stat(pathName)
                     respParameters['CreateDate'] = getSMBDate(ctime)
                     respParameters['CreationTime'] = getSMBTime(ctime)
                     respParameters['LastAccessDate'] = getSMBDate(atime)
@@ -2094,9 +2121,9 @@ class SMBCommands:
                     respParameters['FileDataSize'] = size
                     respParameters['FileAllocationSize'] = size
                     attribs = 0
-                    if os.path.isdir(pathName):
+                    if vfs_isdir(pathName):
                         attribs = smb.SMB_FILE_ATTRIBUTE_DIRECTORY
-                    if os.path.isfile(pathName):
+                    if vfs_isfile(pathName):
                         attribs = smb.SMB_FILE_ATTRIBUTE_NORMAL
                     respParameters['FileAttributes'] = attribs
                 except Exception as e:
@@ -2163,19 +2190,19 @@ class SMBCommands:
             elif createDisposition & smb.FILE_OVERWRITE_IF == smb.FILE_OVERWRITE_IF:
                 mode |= os.O_TRUNC | os.O_CREAT
             elif createDisposition & smb.FILE_OVERWRITE == smb.FILE_OVERWRITE:
-                if os.path.exists(pathName) is True:
+                if vfs_exists(pathName) is True:
                     mode |= os.O_TRUNC
                 else:
                     errorCode = STATUS_NO_SUCH_FILE
             elif createDisposition & smb.FILE_OPEN_IF == smb.FILE_OPEN_IF:
                 mode |= os.O_CREAT
             elif createDisposition & smb.FILE_CREATE == smb.FILE_CREATE:
-                if os.path.exists(pathName) is True:
+                if vfs_exists(pathName) is True:
                     errorCode = STATUS_OBJECT_NAME_COLLISION
                 else:
                     mode |= os.O_CREAT
             elif createDisposition & smb.FILE_OPEN == smb.FILE_OPEN:
-                if os.path.exists(pathName) is not True and (
+                if vfs_exists(pathName) is not True and (
                         str(pathName) in smbServer.getRegisteredNamedPipes()) is not True:
                     errorCode = STATUS_NO_SUCH_FILE
 
@@ -2196,7 +2223,7 @@ class SMBCommands:
                     if createOptions & smb.FILE_DIRECTORY_FILE == smb.FILE_DIRECTORY_FILE:
                         try:
                             # Let's create the directory
-                            os.mkdir(pathName)
+                            vfs_mkdir(pathName)
                             mode = os.O_RDONLY
                         except Exception as e:
                             smbServer.log("NTCreateAndX: %s,%s,%s" % (pathName, mode, e), logging.ERROR)
@@ -2205,7 +2232,7 @@ class SMBCommands:
                     # If the file being opened is a directory, the server MUST fail the request with
                     # STATUS_FILE_IS_A_DIRECTORY in the Status field of the SMB Header in the server
                     # response.
-                    if os.path.isdir(pathName) is True:
+                    if vfs_isdir(pathName) is True:
                         errorCode = STATUS_FILE_IS_A_DIRECTORY
 
                 if createOptions & smb.FILE_DELETE_ON_CLOSE == smb.FILE_DELETE_ON_CLOSE:
@@ -2213,7 +2240,7 @@ class SMBCommands:
 
                 if errorCode == STATUS_SUCCESS:
                     try:
-                        if os.path.isdir(pathName) and sys.platform == 'win32':
+                        if vfs_isdir(pathName):
                             fid = VOID_FILE_DESCRIPTOR
                         else:
                             if sys.platform == 'win32':
@@ -2223,7 +2250,7 @@ class SMBCommands:
                                 sock = socket.socket()
                                 sock.connect(smbServer.getRegisteredNamedPipes()[str(pathName)])
                             else:
-                                fid = os.open(pathName, mode)
+                                fid = vfs_open(pathName, mode)
                     except Exception as e:
                         smbServer.log("NTCreateAndX: %s,%s,%s" % (pathName, mode, e), logging.ERROR)
                         # print e
@@ -2252,7 +2279,7 @@ class SMBCommands:
                 respParameters['FileType'] = 2
                 respParameters['IPCState'] = 0x5ff
             else:
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     respParameters['FileAttributes'] = smb.SMB_FILE_ATTRIBUTE_DIRECTORY
                     respParameters['IsDirectory'] = 1
                 else:
@@ -3171,19 +3198,19 @@ class SMB2Commands:
             elif createDisposition & smb2.FILE_OVERWRITE_IF == smb2.FILE_OVERWRITE_IF:
                 mode |= os.O_TRUNC | os.O_CREAT
             elif createDisposition & smb2.FILE_OVERWRITE == smb2.FILE_OVERWRITE:
-                if os.path.exists(pathName) is True:
+                if vfs_exists(pathName) is True:
                     mode |= os.O_TRUNC
                 else:
                     errorCode = STATUS_NO_SUCH_FILE
             elif createDisposition & smb2.FILE_OPEN_IF == smb2.FILE_OPEN_IF:
                 mode |= os.O_CREAT
             elif createDisposition & smb2.FILE_CREATE == smb2.FILE_CREATE:
-                if os.path.exists(pathName) is True:
+                if vfs_exists(pathName) is True:
                     errorCode = STATUS_OBJECT_NAME_COLLISION
                 else:
                     mode |= os.O_CREAT
             elif createDisposition & smb2.FILE_OPEN == smb2.FILE_OPEN:
-                if os.path.exists(pathName) is not True and (
+                if vfs_exists(pathName) is not True and (
                         str(pathName) in smbServer.getRegisteredNamedPipes()) is not True:
                     errorCode = STATUS_NO_SUCH_FILE
 
@@ -3204,7 +3231,7 @@ class SMB2Commands:
                     if createOptions & smb2.FILE_DIRECTORY_FILE == smb2.FILE_DIRECTORY_FILE:
                         try:
                             # Let's create the directory
-                            os.mkdir(pathName)
+                            vfs_mkdir(pathName)
                             mode = os.O_RDONLY
                         except Exception as e:
                             smbServer.log("SMB2_CREATE: %s,%s,%s" % (pathName, mode, e), logging.ERROR)
@@ -3213,7 +3240,7 @@ class SMB2Commands:
                     # If the file being opened is a directory, the server MUST fail the request with
                     # STATUS_FILE_IS_A_DIRECTORY in the Status field of the SMB Header in the server
                     # response.
-                    if os.path.isdir(pathName) is True:
+                    if vfs_isdir(pathName) is True:
                         errorCode = STATUS_FILE_IS_A_DIRECTORY
 
                 if createOptions & smb2.FILE_DELETE_ON_CLOSE == smb2.FILE_DELETE_ON_CLOSE:
@@ -3221,7 +3248,7 @@ class SMB2Commands:
 
                 if errorCode == STATUS_SUCCESS:
                     try:
-                        if os.path.isdir(pathName) and sys.platform == 'win32':
+                        if vfs_isdir(pathName):
                             fid = VOID_FILE_DESCRIPTOR
                         else:
                             if sys.platform == 'win32':
@@ -3231,7 +3258,7 @@ class SMB2Commands:
                                 sock = socket.socket()
                                 sock.connect(smbServer.getRegisteredNamedPipes()[ensure_str(pathName)])
                             else:
-                                fid = os.open(pathName, mode)
+                                fid = vfs_open(pathName, mode)
                     except Exception as e:
                         smbServer.log("SMB2_CREATE: %s,%s,%s" % (pathName, mode, e), logging.ERROR)
                         # print e
@@ -3257,7 +3284,7 @@ class SMB2Commands:
                 respSMBCommand['FileAttributes'] = 0x80
 
             else:
-                if os.path.isdir(pathName):
+                if vfs_isdir(pathName):
                     respSMBCommand['FileAttributes'] = smb.SMB_FILE_ATTRIBUTE_DIRECTORY
                 else:
                     respSMBCommand['FileAttributes'] = ntCreateRequest['FileAttributes']
@@ -3321,7 +3348,7 @@ class SMB2Commands:
                     if fileHandle == PIPE_FILE_DESCRIPTOR:
                         connData['OpenedFiles'][fileID]['Socket'].close()
                     elif fileHandle != VOID_FILE_DESCRIPTOR:
-                        os.close(fileHandle)
+                        vfs_close(fileHandle)
                         infoRecord, errorCode = queryFileInformation(os.path.dirname(pathName), os.path.basename(pathName),
                                                                      smb2.SMB2_FILE_NETWORK_OPEN_INFO)
                 except Exception as e:
@@ -3331,10 +3358,10 @@ class SMB2Commands:
                     # Check if the file was marked for removal
                     if connData['OpenedFiles'][fileID]['DeleteOnClose'] is True:
                         try:
-                            if os.path.isdir(pathName):
-                                shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
+                            if vfs_isdir(pathName):
+                                vfs_rmtree(connData['OpenedFiles'][fileID]['FileName'])
                             else:
-                                os.remove(connData['OpenedFiles'][fileID]['FileName'])
+                                vfs_remove(connData['OpenedFiles'][fileID]['FileName'])
                         except Exception as e:
                             smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
                             errorCode = STATUS_ACCESS_DENIED
@@ -3449,7 +3476,7 @@ class SMB2Commands:
                     if informationLevel == smb2.SMB2_FILE_DISPOSITION_INFO:
                         infoRecord = smb.SMBSetFileDispositionInfo(setInfo['Buffer'])
                         if infoRecord['DeletePending'] > 0:
-                            if os.path.isdir(pathName) and os.listdir(pathName):
+                            if vfs_isdir(pathName) and vfs_listdir(pathName):
                                 errorCode = STATUS_DIRECTORY_NOT_EMPTY
                             else:
                                 # Mark this file for removal after closed
@@ -3473,8 +3500,8 @@ class SMB2Commands:
                         fileHandle = connData['OpenedFiles'][fileID]['FileHandle']
                         infoRecord = smb.SMBSetFileEndOfFileInfo(setInfo['Buffer'])
                         if infoRecord['EndOfFile'] > 0:
-                            os.lseek(fileHandle, infoRecord['EndOfFile'] - 1, 0)
-                            os.write(fileHandle, b'\x00')
+                            vfs_lseek(fileHandle, infoRecord['EndOfFile'] - 1, 0)
+                            vfs_write(fileHandle, b'\x00')
                     elif informationLevel == smb2.SMB2_FILE_RENAME_INFO:
                         renameInfo = smb2.FILE_RENAME_INFORMATION_TYPE_2(setInfo['Buffer'])
                         newFileName = normalize_path(renameInfo['FileName'].decode('utf-16le'))
@@ -3483,10 +3510,10 @@ class SMB2Commands:
                             smbServer.log("Path not in current working directory", logging.ERROR)
                             return [smb2.SMB2Error()], None, STATUS_OBJECT_PATH_SYNTAX_BAD
 
-                        if renameInfo['ReplaceIfExists'] == 0 and os.path.exists(newPathName):
+                        if renameInfo['ReplaceIfExists'] == 0 and vfs_exists(newPathName):
                             return [smb2.SMB2Error()], None, STATUS_OBJECT_NAME_COLLISION
                         try:
-                            os.rename(pathName, newPathName)
+                            vfs_rename(pathName, newPathName)
                             connData['OpenedFiles'][fileID]['FileName'] = newPathName
                         except Exception as e:
                             smbServer.log("smb2SetInfo: %s" % e, logging.ERROR)
@@ -3548,9 +3575,9 @@ class SMB2Commands:
                     if fileHandle != PIPE_FILE_DESCRIPTOR:
                         offset = writeRequest['Offset']
                         # If we're trying to write past the file end we just skip the write call (Vista does this)
-                        if os.lseek(fileHandle, 0, 2) >= offset:
-                            os.lseek(fileHandle, offset, 0)
-                            os.write(fileHandle, writeRequest['Buffer'])
+                        if vfs_lseek(fileHandle, 0, 2) >= offset:
+                            vfs_lseek(fileHandle, offset, 0)
+                            vfs_write(fileHandle, writeRequest['Buffer'])
                     else:
                         sock = connData['OpenedFiles'][fileID]['Socket']
                         sock.send(writeRequest['Buffer'])
@@ -3594,8 +3621,8 @@ class SMB2Commands:
                 try:
                     if fileHandle != PIPE_FILE_DESCRIPTOR:
                         offset = readRequest['Offset']
-                        os.lseek(fileHandle, offset, 0)
-                        content = os.read(fileHandle, readRequest['Length'])
+                        vfs_lseek(fileHandle, offset, 0)
+                        content = vfs_read(fileHandle, readRequest['Length'])
                     else:
                         sock = connData['OpenedFiles'][fileID]['Socket']
                         content = sock.recv(readRequest['Length'])
@@ -3668,7 +3695,7 @@ class SMB2Commands:
 
         # If the open is not an open to a directory, the request MUST be failed
         # with STATUS_INVALID_PARAMETER.
-        if os.path.isdir(connData['OpenedFiles'][fileID]['FileName']) is False:
+        if vfs_isdir(connData['OpenedFiles'][fileID]['FileName']) is False:
             return [smb2.SMB2Error()], None, STATUS_INVALID_PARAMETER
 
         # If any other information class is specified in the FileInformationClass
